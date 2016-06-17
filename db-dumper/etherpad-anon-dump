@@ -1,0 +1,363 @@
+#!/usr/bin/python
+
+# Copyright (C) 2015  Stefano Zacchiroli <zack@upsilon.cc>
+# License: GNU General Public License version 3, or any later version
+
+# Depends: python-sqlalchemy, python-mysqldb
+
+# DB format documentation:
+# http://etherpad.org/doc/v1.1.4/#all_database_structure
+
+from __future__ import print_function
+
+import argparse
+import errno
+import functools
+import gzip
+import json
+import logging
+import MySQLdb.cursors
+import random
+import string
+import unicodedata
+
+from sqlalchemy import create_engine
+
+
+# character denoting the beginning of the "character bank" in Etherpad
+# changesets. See spec at
+# https://github.com/ether/etherpad-lite/blob/develop/doc/easysync/easysync-notes.txt
+CHAR_BANK_DELIM = '$'
+
+
+class EtherpadStore(object):
+
+    def __init__(self, anonymize=True):
+        self.anonymize = anonymize
+
+    def __iter__(self):
+        return self
+
+    def next(self):
+        raise NotImplementedError('EtherpadStore.next: abstract class')
+
+    def list_pads(self):
+        raise NotImplementedError('EtherpadStore.list_pads: abstract class')
+
+
+class EtherpadDb(EtherpadStore):
+
+    def __init__(self, dburi, anonymize=True):
+        super(EtherpadDb, self).__init__(anonymize)
+        logging.info('using MySQL backend')
+        self.engine = create_engine(dburi,
+                                    connect_args={'cursorclass':
+                                                  MySQLdb.cursors.SSCursor})
+        self.connection = self.engine.connect()
+        self.result = None
+
+    def list_pads(self):
+        logging.info('listing pads')
+        padnames = {}
+
+        q = """SELECT value FROM store
+               WHERE `key` LIKE 'readonly2pad:%%'"""
+        res = self.connection.execution_options(stream_results=True) \
+                             .execute(q)
+        for row in res:
+            name = json.loads(row['value'])
+            padnames[name] = randomize_text(name)
+
+        return padnames
+
+    def next(self):
+        if self.result is None:
+            self.result = self.connection \
+                              .execution_options(stream_results=True) \
+                              .execute('select * from store')
+        row = self.result.fetchone()
+        if row is None:
+            raise StopIteration
+        else:
+            return row
+
+
+class EtherpadDump(EtherpadStore):
+
+    def __init__(self, tabfile, anonymize=True, charset='utf8'):
+        super(EtherpadDump, self).__init__(anonymize)
+        logging.info('using tab-separated file backend')
+        self.filename = tabfile
+        self.charset = charset
+        self.f = None  # file-like object
+
+    def list_pads(self):
+        logging.info('listing pads')
+        padnames = {}
+        for i in self:
+            if i['key'].startswith('readonly2pad:'):
+                name = json.loads(i['value'])
+                padnames[name] = randomize_text(name)
+
+        return padnames
+
+    def next(self):
+        if self.f is None:
+            if self.filename.endswith('.gz'):
+                self.f = gzip.open(self.filename, 'r')
+            else:
+                self.f = open(self.filename, 'r')
+
+        s = self.f.readline().rstrip().decode(self.charset)
+        if not s:
+            self.f.close()
+            self.f = None
+            raise StopIteration
+
+        fields = s.split('\t', 1)
+        if len(fields) != 2:
+            logging.errror('ignoring malformed line: ' + s)
+            return self.next()
+        else:
+            return {'key': fields[0], 'value': fields[1]}
+
+
+def randomize_text(s):
+    """randomize a text string, preserving its length
+
+    Only letter and digit characters are randomize; spaces, punctuation, and
+    other symbols or control characters are preserved as is.
+
+    """
+    random_s = ''
+    for char in s:
+        try:
+            cat = unicodedata.category(unicode(char))[0]
+        except TypeError:  # result of unicode(char) is not a _single_ char
+            logging.warn("replacing weird unicode char with 'W'")
+            random_s += 'W'
+            continue
+        # see Unicode general categories at
+        # http://www.unicode.org/reports/tr44/tr44-4.html#General_Category_Values
+        if cat is 'L':  # letter
+            random_s += random.choice(string.letters)
+        elif cat is 'N':  # digit
+            random_s += random.choice(string.digits)
+        else:  # preserve other kinds of characters
+            random_s += char
+        # elif cat is 'M':  # space
+        #     random_s += random.choice(string.whitespace)
+        # elif cat is 'P':  # punctuation
+        #     random_s += random.choice(string.punctuation)
+        # elif cat is 'S':  # symbols
+        #     random_s += char
+        # elif cat is 'Z':  # separators
+        #     random_s += char
+        # elif cat is 'C':  # control
+        #     random_s += char
+    return random_s
+
+
+def randomize_changeset(s):
+    """randomize the payload of an Etherpad changeset
+
+    """
+    random_s = ''
+
+    bank_delim_pos = s.find(CHAR_BANK_DELIM)
+    if bank_delim_pos >= 0:
+        fst_bank_char_pos = bank_delim_pos + 1
+        random_s += s[0:fst_bank_char_pos]  # copy up to '$', included
+        random_s += randomize_text(s[fst_bank_char_pos:])  # randomize rest
+    else:
+        logging.warn('changeset without character bank, copying it verbatim: '
+                     + s)
+        random_s = s
+
+    return random_s
+
+
+def if_has_path(keys):
+    """decorate a function to type check the first argument for the present of a
+    given "path" of JSON keys.
+
+    It will be checked that the first argument is a dictionary, containing the
+    first key in keys. That key will then be looked up, and recursively checked
+    against subsequent keys in keys.
+
+    If type checking fails, the function will silently return (None) --- hence
+    the "if" in the decorator name.
+
+    """
+    def decorator(f):
+        @functools.wraps(f)
+        def wrapper(*args, **kwargs):
+            j = args[1]  # json subject to be tested
+            for k in keys:
+                if not isinstance(j, dict) or k not in j:
+                    return
+                j = j[k]  # recurse into json subtree
+            return f(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
+@if_has_path(['atext', 'text'])
+def scramble_atext(k, j, padnames):
+    j['atext']['text'] = randomize_text(j['atext']['text'])
+
+
+@if_has_path(['meta', 'atext', 'text'])
+def scramble_meta_atext(k, j, padnames):
+    j['meta']['atext']['text'] = randomize_text(j['meta']['atext']['text'])
+
+
+@if_has_path(['changeset'])
+def scramble_changeset(k, j, padnames):
+    j['changeset'] = randomize_changeset(j['changeset'])
+
+
+@if_has_path(['text'])
+def scramble_chat_text(k, j, padnames):
+    j['text'] = randomize_text(j['text'])
+
+
+@if_has_path(['name'])
+def scramble_author(k, j, padnames):
+    if j['name'] is not None:
+        j['name'] = randomize_text(j['name'])
+
+
+@if_has_path(['user', 'password'])
+def empty_auth_password(k, j, padnames):
+    # not using randomize_text to avoid leaking password length
+    j['user']['password'] = ''
+
+
+@if_has_path(['user', 'username'])
+def empty_auth_username(k, j, padnames):
+    # not using randomize_text to avoid leaking password length
+    j['user']['username'] = ''
+
+
+@if_has_path(['passwordHash'])
+def empty_auth_passwordhash(k, j, padnames):
+    # not using randomize_text to avoid leaking password length
+    j['passwordHash'] = ''
+
+
+@if_has_path(['padIDs'])
+def fix_author_padids(k, j, padnames):
+    dels = []  # keys to delete from j['padIDs']
+    adds = []  # (k,v) pairs to add to j['padIDs']
+    for k, v in j['padIDs'].iteritems():
+        if k in padnames:
+            dels.append(k)
+            new_pad_name = padnames[k]
+            adds.append((new_pad_name, v))
+    j['padIDs'].update(adds)
+    for k in dels:
+        del(j['padIDs'][k])
+
+
+SCRAMBLE_PASSES = [
+    scramble_atext,
+    scramble_changeset,
+    scramble_meta_atext,
+    scramble_author,
+    empty_auth_password,
+    empty_auth_username,
+    empty_auth_passwordhash,
+    fix_author_padids,
+    scramble_chat_text,
+]
+
+
+def scramble_json(k, j, padnames):
+    if k.startswith('readonly2pad:'):
+        j = padnames[j]
+    else:
+        for f in SCRAMBLE_PASSES:
+            f(k, j, padnames)
+    return j
+
+
+def fix_key(k, padnames):
+    steps = k.split(':')
+    if len(steps) >= 2 and steps[0] in ['pad', 'pad2readonly']:
+        old_pad_name = steps[1]
+        if old_pad_name in padnames:
+            new_pad_name = padnames[old_pad_name]
+            steps[1] = new_pad_name
+    return ':'.join(steps)
+
+
+def dump_db(store, padnames, anonymize=True):
+    logging.info('found %d padnames', len(padnames))
+    logging.info('dumping...')
+    for row in store:
+        k = row['key']
+        logging.debug('processing key: %s' % k)
+        try:
+            j = json.loads(row['value'])
+        except ValueError:
+            logging.warn('ignoring non decodable json: ' + row['value'])
+            continue
+        if anonymize:
+            j = scramble_json(k, j, padnames)
+            k = fix_key(k, padnames)
+        print(json.dumps(k), end='')
+        print('\t', end='')
+        print(json.dumps(j))
+
+
+def db_connect(conf):
+    engine = create_engine(conf.dburi,
+                           connect_args={'cursorclass':
+                                         MySQLdb.cursors.SSCursor})
+    conn = engine.connect()
+    return conn
+
+
+def main():
+    cmdline = argparse.ArgumentParser(
+        description='dump Etherpad SQL database, scrambling its content')
+    cmdline.add_argument('store', metavar='ETHERPAD_STORE',
+                         help='either an sqlalchemy DB connection URI, e.g.,'
+                         + ' mysql://user:pass@localhost/dbname ; or a'
+                         + ' <key, value> tab separated file obtained using'
+                         + ' mysqldump --tab')
+    cmdline.add_argument('--charset', '-c',
+                         default='utf8',
+                         help='charset (for tab-separate file only)')
+    cmdline.add_argument('--verbose', '-v', action='count',
+                         default=0,
+                         help='increase verbosity')
+    cmdline.add_argument('--no-anon', '-n', action='store_false',
+                         dest='anonymize', default=True,
+                         help='do not anonymize, dump DB as is')
+    args = cmdline.parse_args()
+
+    loglevel = logging.WARN
+    if args.verbose >= 2:
+        loglevel = logging.DEBUG
+    elif args.verbose >= 1:
+        loglevel = logging.INFO
+    logging.basicConfig(level=loglevel)
+
+    if args.store.startswith('mysql:'):
+        store = EtherpadDb(args.store, args.anonymize)
+    else:
+        store = EtherpadDump(args.store, args.anonymize, charset=args.charset)
+    padnames = store.list_pads()
+    dump_db(store, padnames, anonymize=args.anonymize)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except IOError, e:
+        if e.errno == errno.EPIPE:
+            pass
+        else:
+            raise

@@ -6,7 +6,7 @@
 #
 
 # Location of the anonymized database dump (db-dumper/)
-DB_FILE="/srv/angelo/etherpad-wikimedia-anon-dump"
+DB_FILE="dump.sql"
 
 # Results directory
 RESULTS="results/"

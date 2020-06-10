@@ -6,7 +6,7 @@ This repository contains all the code used for the experiments in the paper "Spa
 
 # Install dependencies
 ```
-sudo apt install python3-mysqldb python-sqlalchemy python3-dev default-libmysqlclient-dev build-essential php parallel
+sudo apt install python3-mysqldb python-sqlalchemy python3-dev default-libmysqlclient-dev build-essential php
 npm install fast-csv graceful-fs md5
 ```
 
@@ -42,4 +42,4 @@ Please note, the DB_FILE must be changed to point to the <db_dump_file> obtained
   * gathering stats and printing them out
 
 # License
-TBD
+GNU GENERAL PUBLIC LICENSE
